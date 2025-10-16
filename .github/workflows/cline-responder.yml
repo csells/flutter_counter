@@ -1,0 +1,177 @@
+name: Cline Issue Assistant
+
+on:
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  issues: write
+
+jobs:
+  respond:
+    runs-on: ubuntu-latest
+    environment: cline-actions
+    steps:
+      - name: Check for @cline mention
+        id: detect
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.comment?.body || "";
+            const isPR = !!context.payload.issue?.pull_request;
+            const hit = body.toLowerCase().includes("@cline");
+            core.setOutput("hit", (!isPR && hit) ? "true" : "false");
+            core.setOutput("issue_number", String(context.payload.issue?.number || ""));
+            core.setOutput("issue_url", context.payload.issue?.html_url || "");
+            core.setOutput("comment_body", body);
+
+      - name: Checkout repository
+        if: steps.detect.outputs.hit == 'true'
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Cline CLI
+        if: steps.detect.outputs.hit == 'true'
+        run: |
+          # check node version
+          node --version
+          
+          # Install the latest Cline CLI
+          sudo npm install -g cline@nightly
+          
+          # Verify
+          cline version
+
+      - name: Create Cline Instance
+        if: steps.detect.outputs.hit == 'true'
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          CLINE_DIR: ${{ runner.temp }}/cline
+        run: |
+          set -x  # Enable bash debugging
+          
+          # Show environment
+          echo "=== Environment ==="
+          echo "Node version: $(node --version)"
+          echo "NPM version: $(npm --version)"
+          echo "HOME: $HOME"
+          echo "CLINE_DIR: $CLINE_DIR"
+          echo "PWD: $(pwd)"
+          
+          # Setup CLINE_DIR
+          mkdir -p "$CLINE_DIR"
+          chmod 700 "$CLINE_DIR"
+          echo "Created CLINE_DIR at: $CLINE_DIR"
+          
+          # Create instance and capture output
+          echo "=== Creating Cline instance ==="
+          INSTANCE_OUTPUT=$(cline instance new -v 2>&1) || {
+            echo "$INSTANCE_OUTPUT"
+            echo "=== Instance creation failed ==="
+            
+            # Dump all log files from the actual location Cline uses
+            ACTUAL_CLINE_DIR="$HOME/.cline"
+            
+            echo "=== Cline Core Logs ==="
+            if [ -d "$ACTUAL_CLINE_DIR/logs" ]; then
+              for logfile in "$ACTUAL_CLINE_DIR/logs"/cline-core-*.log; do
+                if [ -f "$logfile" ]; then
+                  echo "--- $logfile ---"
+                  cat "$logfile"
+                fi
+              done
+            else
+              echo "No core logs directory found at $ACTUAL_CLINE_DIR/logs"
+            fi
+            
+            echo "=== Cline Host Logs ==="
+            if [ -d "$ACTUAL_CLINE_DIR/logs" ]; then
+              for logfile in "$ACTUAL_CLINE_DIR/logs"/cline-host-*.log; do
+                if [ -f "$logfile" ]; then
+                  echo "--- $logfile ---"
+                  cat "$logfile"
+                fi
+              done
+            else
+              echo "No host logs directory found at $ACTUAL_CLINE_DIR/logs"
+            fi
+            
+            # Check database in multiple locations
+            echo "=== Database Check ==="
+            echo "Checking in CLINE_DIR ($CLINE_DIR):"
+            if [ -f "$CLINE_DIR/x/locks.db" ]; then
+              echo "  Database exists at $CLINE_DIR/x/locks.db"
+              ls -la "$CLINE_DIR/x/locks.db"
+            else
+              echo "  Database NOT found"
+            fi
+            
+            echo "Checking in actual Cline dir ($ACTUAL_CLINE_DIR):"
+            if [ -f "$ACTUAL_CLINE_DIR/x/locks.db" ]; then
+              echo "  Database exists at $ACTUAL_CLINE_DIR/x/locks.db"
+              ls -la "$ACTUAL_CLINE_DIR/x/locks.db"
+            else
+              echo "  Database NOT found"
+            fi
+            
+            echo "Contents of actual Cline directory:"
+            ls -laR "$ACTUAL_CLINE_DIR" || echo "Directory doesn't exist"
+            
+            exit 1
+          }
+          
+          # Display output
+          echo "$INSTANCE_OUTPUT"
+          
+          # Parse address from output (format: "  Address: 127.0.0.1:36733")
+          echo "=== Extracting instance address ==="
+          CLINE_ADDRESS=$(echo "$INSTANCE_OUTPUT" | grep "Address:" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]+' | head -1)
+          echo "CLINE_ADDRESS: $CLINE_ADDRESS"
+          echo "CLINE_ADDRESS=$CLINE_ADDRESS" >> $GITHUB_ENV
+          
+          # Configure API key
+          echo "=== Configuring API key ==="
+          cline config set open-router-api-key=$OPENROUTER_API_KEY --address $CLINE_ADDRESS -v
+
+      - name: Download analyze script
+        if: steps.detect.outputs.hit == 'true'
+        run: |
+          curl -L https://raw.githubusercontent.com/csells/flutter_counter/refs/heads/master/git-scripts/analyze-issue.sh -o analyze-issue.sh -H "Cache-Control: no-cache" 
+          chmod +x analyze-issue.sh
+
+      - name: Run analysis
+        if: steps.detect.outputs.hit == 'true'
+        id: analyze
+        env:
+          ISSUE_URL: ${{ steps.detect.outputs.issue_url }}
+          COMMENT: ${{ steps.detect.outputs.comment_body }}
+          CLINE_ADDRESS: ${{ env.CLINE_ADDRESS }}
+        run: |
+          set -euo pipefail
+          
+          RESULT=$(./analyze-issue.sh "${ISSUE_URL}" "Analyze this issue. The user asked: ${COMMENT}" "$CLINE_ADDRESS")
+          
+          {
+            echo 'result<<EOF'
+            printf "%s\n" "$RESULT"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post response
+        if: steps.detect.outputs.hit == 'true'
+        uses: actions/github-script@v7
+        env:
+          ISSUE_NUMBER: ${{ steps.detect.outputs.issue_number }}
+          RESULT: ${{ steps.analyze.outputs.result }}
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(process.env.ISSUE_NUMBER),
+              body: process.env.RESULT || "(no output)"
+            });
